@@ -1,0 +1,22 @@
+---
+# CartIt Jenkins Setup Playbook
+# Usage: ansible-playbook -i inventory.ini jenkins-setup.yml
+#        (run via SSH tunnel through Bastion)
+
+- name: Configure CartIt Jenkins Server
+  hosts: jenkins
+  become: true
+  vars:
+    sonarqube_ip: "{{ hostvars['sonarqube']['ansible_private_ip'] }}"
+
+  roles:
+    - common
+    - jenkins
+
+- name: Configure CartIt SonarQube Server
+  hosts: sonarqube
+  become: true
+
+  roles:
+    - common
+    - sonarqube

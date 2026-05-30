@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cartit
+  labels:
+    app.kubernetes.io/name: cartit
+    environment: production

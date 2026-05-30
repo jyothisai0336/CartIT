@@ -1,0 +1,151 @@
+pipeline {
+  agent { label 'docker-agent' }
+
+  environment {
+    APP_NAME     = 'cartit-frontend'
+    ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com"
+    ECR_REPO     = "${ECR_REGISTRY}/cartit-frontend"
+    IMAGE_TAG    = "${GIT_COMMIT[0..7]}"
+    AWS_REGION   = 'ap-south-1'
+  }
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 45, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script { env.BRANCH = env.GIT_BRANCH.replaceAll("origin/","") }
+      }
+    }
+
+    stage('Install') {
+      steps { sh 'npm ci --frozen-lockfile' }
+    }
+
+    stage('Lint') {
+      steps { sh 'npm run lint -- --max-warnings=0' }
+    }
+
+    stage('Unit Tests') {
+      steps { sh 'npm test -- --coverage --watchAll=false --ci' }
+      post {
+        always {
+          junit 'coverage/junit.xml'
+          publishHTML([allowMissing:false,alwaysLinkToLastBuild:true,keepAll:true,reportDir:'coverage/lcov-report',reportFiles:'index.html',reportName:'Coverage Report'])
+        }
+      }
+    }
+
+    stage('SAST — SonarQube') {
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          sh "sonar-scanner -Dsonar.projectKey=cartit-frontend -Dsonar.sources=src -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info"
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        timeout(time:5, unit:'MINUTES') { waitForQualityGate abortPipeline: true }
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh """
+          docker build \
+            --no-cache \
+            --build-arg GIT_COMMIT=${IMAGE_TAG} \
+            -t ${ECR_REPO}:${IMAGE_TAG} \
+            -t ${ECR_REPO}:latest \
+            -f devops/docker/Dockerfile .
+        """
+      }
+    }
+
+    stage('Trivy Scan') {
+      steps {
+        sh """
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format table \
+            --output trivy-report.txt \
+            ${ECR_REPO}:${IMAGE_TAG}
+        """
+      }
+      post { always { archiveArtifacts artifacts:'trivy-report.txt', allowEmptyArchive:true } }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        withAWS(credentials:'aws-ecr-credentials', region:"${AWS_REGION}") {
+          sh """
+            aws ecr get-login-password --region ${AWS_REGION} \
+              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            docker push ${ECR_REPO}:${IMAGE_TAG}
+            docker push ${ECR_REPO}:latest
+          """
+        }
+      }
+    }
+
+    stage('Deploy Dev') {
+      when { branch 'develop' }
+      steps { deployToEKS('dev') }
+    }
+
+    stage('Deploy Staging') {
+      when { branch 'staging' }
+      steps { deployToEKS('staging') }
+    }
+
+    stage('Deploy Production') {
+      when { branch 'main' }
+      steps {
+        timeout(time:5, unit:'MINUTES') {
+          input message: "Deploy ${IMAGE_TAG} to PRODUCTION?", ok: 'Deploy'
+        }
+        deployToEKS('prod')
+        invalidateCloudFront()
+        smokeTest('https://cartit.in')
+      }
+    }
+  }
+
+  post {
+    success { slackSend channel:'#deployments', color:'good',   message:"✅ CartIt ${IMAGE_TAG} deployed to ${env.BRANCH}" }
+    failure { slackSend channel:'#deployments', color:'danger', message:"❌ CartIt FAILED on ${env.BRANCH} — ${env.BUILD_URL}" }
+    always  { sh 'docker rmi ${ECR_REPO}:${IMAGE_TAG} || true'; cleanWs() }
+  }
+}
+
+def deployToEKS(String env) {
+  withAWS(credentials:'aws-eks-credentials', region:"${AWS_REGION}") {
+    sh """
+      aws eks update-kubeconfig --name cartit-${env} --region ${AWS_REGION}
+      cd devops/kubernetes/overlays/${env}
+      kustomize edit set image ${ECR_REPO}:${IMAGE_TAG}
+      kustomize build . | kubectl apply -f -
+      kubectl rollout status deployment/cartit-frontend -n cartit --timeout=10m
+    """
+  }
+}
+
+def invalidateCloudFront() {
+  withAWS(credentials:'aws-ecr-credentials', region:"${AWS_REGION}") {
+    sh "aws cloudfront create-invalidation --distribution-id ${CF_DISTRIBUTION_ID} --paths '/*'"
+  }
+}
+
+def smokeTest(String url) {
+  sh "sleep 30 && curl -sf ${url}/health | grep -q 'ok' && echo '✅ Smoke test passed'"
+}

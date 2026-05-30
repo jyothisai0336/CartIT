@@ -1,0 +1,85 @@
+---
+# CartIt Jenkins Post-Install Configuration
+# Run after Terraform creates the EC2 instance
+# ansible-playbook -i inventory.ini jenkins-setup.yml
+
+- name: Wait for Jenkins to start
+  uri:
+    url: "http://localhost:8080/login"
+    status_code: 200
+  register: result
+  until: result.status == 200
+  retries: 30
+  delay: 10
+
+- name: Get Jenkins initial admin password
+  slurp:
+    src: /var/lib/jenkins/secrets/initialAdminPassword
+  register: jenkins_password
+
+- name: Print initial admin password
+  debug:
+    msg: "Jenkins initial password: {{ jenkins_password['content'] | b64decode }}"
+
+- name: Install Jenkins plugins
+  jenkins_plugin:
+    name: "{{ item }}"
+    url_password: "{{ jenkins_password['content'] | b64decode }}"
+  loop:
+    - git
+    - github
+    - github-branch-source
+    - workflow-aggregator
+    - pipeline-stage-view
+    - credentials-binding
+    - aws-credentials
+    - amazon-ecr
+    - docker-workflow
+    - docker-plugin
+    - sonar
+    - slack
+    - html-publisher
+    - junit
+    - blueocean
+    - authorize-project
+
+- name: Restart Jenkins after plugin install
+  service:
+    name: jenkins
+    state: restarted
+
+- name: Configure Jenkins JVM options
+  lineinfile:
+    path: /etc/sysconfig/jenkins
+    regexp: '^JENKINS_JAVA_OPTIONS='
+    line: 'JENKINS_JAVA_OPTIONS="-Djava.awt.headless=true -Xmx2g -Xms512m"'
+
+- name: Set Jenkins URL
+  template:
+    src: jenkins-location.xml.j2
+    dest: /var/lib/jenkins/jenkins.model.JenkinsLocationConfiguration.xml
+    owner: jenkins
+    group: jenkins
+
+- name: Ensure Docker socket accessible by Jenkins
+  user:
+    name: jenkins
+    groups: docker
+    append: yes
+
+- name: Configure global tool — SonarQube Scanner
+  copy:
+    content: |
+      <?xml version='1.1' encoding='UTF-8'?>
+      <hudson.plugins.sonar.SonarGlobalConfiguration>
+        <installations>
+          <hudson.plugins.sonar.SonarInstallation>
+            <name>SonarQube</name>
+            <serverUrl>http://{{ sonarqube_ip }}:9000</serverUrl>
+            <credentialsId>sonarqube-token</credentialsId>
+          </hudson.plugins.sonar.SonarInstallation>
+        </installations>
+      </hudson.plugins.sonar.SonarGlobalConfiguration>
+    dest: /var/lib/jenkins/hudson.plugins.sonar.SonarGlobalConfiguration.xml
+    owner: jenkins
+    group: jenkins
